@@ -1,6 +1,5 @@
 use crate::error::{Result, VaultError};
-use keyring::Entry;
-use base64::{Engine as _, engine::general_purpose};
+use base64::Engine;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 
@@ -125,13 +124,211 @@ impl KeyStorage for WindowsKeyStorage {
     }
 }
 
-/// macOS implementation (placeholder for future)
-#[cfg(target_os = "macos")]
-pub struct MacOSKeyStorage;
-
-/// Linux implementation (placeholder for future)
+/// Linux implementation using Secret Service via keyring crate
 #[cfg(target_os = "linux")]
-pub struct LinuxKeyStorage;
+pub struct LinuxKeyStorage {
+    service_name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxKeyStorage {
+    pub fn new(service_name: impl Into<String>) -> Self {
+        Self {
+            service_name: service_name.into(),
+        }
+    }
+    
+    fn get_entry(&self, key_id: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(&self.service_name, key_id)
+            .map_err(|e| VaultError::Keychain(format!("Failed to create entry: {}", e)))
+    }
+    
+    fn get_metadata_entry(&self, key_id: &str) -> Result<keyring::Entry> {
+        let metadata_key = format!("{}_metadata", key_id);
+        keyring::Entry::new(&self.service_name, &metadata_key)
+            .map_err(|e| VaultError::Keychain(format!("Failed to create metadata entry: {}", e)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl KeyStorage for LinuxKeyStorage {
+    fn store_key(&self, key_id: &str, key: &[u8], metadata: KeyMetadata) -> Result<()> {
+        // Store the key
+        let entry = self.get_entry(key_id)?;
+        let key_str = base64::engine::general_purpose::STANDARD.encode(key);
+        entry
+            .set_password(&key_str)
+            .map_err(|e| VaultError::Keychain(format!("Failed to store key: {}", e)))?;
+        
+        // Store metadata separately
+        let metadata_entry = self.get_metadata_entry(key_id)?;
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| VaultError::Keychain(format!("Failed to serialize metadata: {}", e)))?;
+        metadata_entry
+            .set_password(&metadata_json)
+            .map_err(|e| VaultError::Keychain(format!("Failed to store metadata: {}", e)))?;
+        
+        Ok(())
+    }
+    
+    fn retrieve_key(&self, key_id: &str) -> Result<(Vec<u8>, KeyMetadata)> {
+        // Retrieve the key
+        let entry = self.get_entry(key_id)?;
+        let key_str = entry
+            .get_password()
+            .map_err(|e| VaultError::Keychain(format!("Failed to retrieve key: {}", e)))?;
+        
+        let key_data = base64::engine::general_purpose::STANDARD.decode(&key_str)
+            .map_err(|e| VaultError::Keychain(format!("Failed to decode key: {}", e)))?;
+        
+        // Retrieve metadata
+        let metadata_entry = self.get_metadata_entry(key_id)?;
+        let metadata_json = metadata_entry
+            .get_password()
+            .map_err(|e| VaultError::Keychain(format!("Failed to retrieve metadata: {}", e)))?;
+        
+        let metadata: KeyMetadata = serde_json::from_str(&metadata_json)
+            .map_err(|e| VaultError::Keychain(format!("Failed to parse metadata: {}", e)))?;
+        
+        Ok((key_data, metadata))
+    }
+    
+    fn delete_key(&self, key_id: &str) -> Result<()> {
+        // Delete key
+        let entry = self.get_entry(key_id)?;
+        entry
+            .delete_password()
+            .map_err(|e| VaultError::Keychain(format!("Failed to delete key: {}", e)))?;
+        
+        // Delete metadata
+        let metadata_entry = self.get_metadata_entry(key_id)?;
+        let _ = metadata_entry.delete_password(); // Ignore error if metadata doesn't exist
+        
+        Ok(())
+    }
+    
+    fn key_exists(&self, key_id: &str) -> bool {
+        self.get_entry(key_id)
+            .and_then(|entry| {
+                entry
+                    .get_password()
+                    .map(|_| true)
+                    .map_err(|_| VaultError::Keychain("Key not found".to_string()))
+            })
+            .unwrap_or(false)
+    }
+    
+    fn list_keys(&self) -> Result<Vec<String>> {
+        // Note: Linux Secret Service doesn't provide a native list API
+        // We'd need to maintain a separate index or use the secret-service crate directly
+        // For now, return empty list with a note
+        eprintln!("⚠️  list_keys() is not efficiently supported by Linux keyring crate");
+        Ok(vec![])
+    }
+}
+
+/// macOS Keychain implementation
+#[cfg(target_os = "macos")]
+pub struct MacOSKeyStorage {
+    service_name: String,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOSKeyStorage {
+    pub fn new(service_name: &str) -> Self {
+        Self {
+            service_name: service_name.to_string(),
+        }
+    }
+    
+    fn get_entry(&self, key_id: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(&self.service_name, key_id)
+            .map_err(|e| VaultError::Keychain(format!("Failed to create entry: {}", e)))
+    }
+    
+    fn get_metadata_entry(&self, key_id: &str) -> Result<keyring::Entry> {
+        let metadata_key = format!("{}_metadata", key_id);
+        keyring::Entry::new(&self.service_name, &metadata_key)
+            .map_err(|e| VaultError::Keychain(format!("Failed to create metadata entry: {}", e)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl KeyStorage for MacOSKeyStorage {
+    fn store_key(&self, key_id: &str, key: &[u8], metadata: KeyMetadata) -> Result<()> {
+        // Store the key
+        let entry = self.get_entry(key_id)?;
+        let key_str = base64::engine::general_purpose::STANDARD.encode(key);
+        entry
+            .set_password(&key_str)
+            .map_err(|e| VaultError::Keychain(format!("Failed to store key: {}", e)))?;
+        
+        // Store metadata separately
+        let metadata_entry = self.get_metadata_entry(key_id)?;
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| VaultError::Keychain(format!("Failed to serialize metadata: {}", e)))?;
+        metadata_entry
+            .set_password(&metadata_json)
+            .map_err(|e| VaultError::Keychain(format!("Failed to store metadata: {}", e)))?;
+        
+        Ok(())
+    }
+    
+    fn retrieve_key(&self, key_id: &str) -> Result<(Vec<u8>, KeyMetadata)> {
+        // Retrieve the key
+        let entry = self.get_entry(key_id)?;
+        let key_str = entry
+            .get_password()
+            .map_err(|e| VaultError::Keychain(format!("Failed to retrieve key: {}", e)))?;
+        
+        let key_data = base64::engine::general_purpose::STANDARD.decode(&key_str)
+            .map_err(|e| VaultError::Keychain(format!("Failed to decode key: {}", e)))?;
+        
+        // Retrieve metadata
+        let metadata_entry = self.get_metadata_entry(key_id)?;
+        let metadata_json = metadata_entry
+            .get_password()
+            .map_err(|e| VaultError::Keychain(format!("Failed to retrieve metadata: {}", e)))?;
+        
+        let metadata: KeyMetadata = serde_json::from_str(&metadata_json)
+            .map_err(|e| VaultError::Keychain(format!("Failed to parse metadata: {}", e)))?;
+        
+        Ok((key_data, metadata))
+    }
+    
+    fn delete_key(&self, key_id: &str) -> Result<()> {
+        // Delete key
+        let entry = self.get_entry(key_id)?;
+        entry
+            .delete_password()
+            .map_err(|e| VaultError::Keychain(format!("Failed to delete key: {}", e)))?;
+        
+        // Delete metadata
+        let metadata_entry = self.get_metadata_entry(key_id)?;
+        let _ = metadata_entry.delete_password(); // Ignore error if metadata doesn't exist
+        
+        Ok(())
+    }
+    
+    fn key_exists(&self, key_id: &str) -> bool {
+        self.get_entry(key_id)
+            .and_then(|entry| {
+                entry
+                    .get_password()
+                    .map(|_| true)
+                    .map_err(|_| VaultError::Keychain("Key not found".to_string()))
+            })
+            .unwrap_or(false)
+    }
+    
+    fn list_keys(&self) -> Result<Vec<String>> {
+        // Note: macOS Keychain doesn't provide a native list API via keyring crate
+        // We'd need to use the Security framework directly or maintain a separate index
+        // For now, return empty list with a note
+        eprintln!("⚠️  list_keys() is not efficiently supported by macOS keyring crate");
+        Ok(vec![])
+    }
+}
 
 /// Factory function to create platform-specific key storage
 pub fn create_key_storage() -> Box<dyn KeyStorage> {
@@ -140,16 +337,14 @@ pub fn create_key_storage() -> Box<dyn KeyStorage> {
         Box::new(WindowsKeyStorage::new("identra-vault"))
     }
     
-    #[cfg(target_os = "macos")]
-    {
-        // TODO: Implement macOS Keychain
-        unimplemented!("macOS keychain not yet implemented")
-    }
-    
     #[cfg(target_os = "linux")]
     {
-        // TODO: Implement Linux Secret Service
-        unimplemented!("Linux Secret Service not yet implemented")
+        Box::new(LinuxKeyStorage::new("identra-vault"))
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(MacOSKeyStorage::new("identra-vault"))
     }
 }
 
@@ -157,21 +352,5 @@ pub fn create_key_storage() -> Box<dyn KeyStorage> {
 mod tests {
     use super::*;
     
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn test_windows_keychain() {
-        let storage = WindowsKeyStorage::new("identra-test");
-        let test_key = b"test_secret_key_12345678901234567890";
-        
-        // Store key
-        storage.store_key("test-key", test_key).unwrap();
-        
-        // Retrieve key
-        let retrieved = storage.retrieve_key("test-key").unwrap();
-        assert_eq!(test_key, &retrieved[..]);
-        
-        // Delete key
-        storage.delete_key("test-key").unwrap();
-        assert!(!storage.key_exists("test-key"));
-    }
+    include!("keychain_tests.rs");
 }
