@@ -5,7 +5,7 @@ use std::env;
 
 mod database;
 mod services;
-mod ipc_client;
+pub mod ipc_client;
 mod auth;
 
 use database::MemoryDatabase;
