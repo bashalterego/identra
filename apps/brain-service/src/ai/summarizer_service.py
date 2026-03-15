@@ -3,7 +3,13 @@ import logging
 import time
 from typing import List, Optional, Dict, Any, Union
 from pydantic import BaseModel, Field
-import ollama
+
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+    ollama = None
 
 # Configure structured logging
 logging.basicConfig(level=logging.INFO)
@@ -191,6 +197,9 @@ class SummarizerService:
         
         # We run this in a thread executor because ollama.chat is synchronous (blocking)
         # unless we use the AsyncClient. Here we wrap the standard client for simplicity/stability.
+        if not OLLAMA_AVAILABLE:
+            raise RuntimeError("Ollama is not installed. Install it or use a cloud provider.")
+
         loop = asyncio.get_event_loop()
         try:
             return await loop.run_in_executor(

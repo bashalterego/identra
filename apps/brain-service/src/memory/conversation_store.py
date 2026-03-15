@@ -23,9 +23,9 @@ class Conversation:
     similarity_score: float = 0.0
 
 class ConversationStore:
-    def __init__(self, db_path: str = "conversations.db"):
+    def __init__(self, embedding_service=None, db_path: str = "conversations.db"):
         self.db_path = db_path
-        self.embedding_service = EmbeddingService()
+        self.embedding_service = embedding_service or EmbeddingService()
         self.SIMILARITY_THRESHOLD = 0.3 
 
     async def initialize(self):

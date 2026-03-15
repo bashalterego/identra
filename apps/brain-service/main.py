@@ -1,279 +1,373 @@
-"""
-Identra Brain-Service - Universal AI Memory & RAG Orchestration
-
-The AI orchestration layer for the Identra confidential memory vault ecosystem.
-Provides universal conversation handling with custom fine-tuned summarization,
-multi-model AI routing, and RAG-powered context management.
-
-Team Ownership: Sailesh (AI/RAG/ML components)
-Integration: Sarthak (gRPC), Manish & OmmPrakash (Desktop)
-"""
-
 import os
-import asyncio
+import time
+import logging
+import uuid
 from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# --- IMPORTS FOR SUMMARIZER SERVICE ---
-# Import from the actual filename: Summarizer_service.py (capital S)
-try:
-    from src.ai.summarizer_service import (
-        SummarizerService, 
-        SummarizationRequest, 
-        SummarizationResponse
-    )
-    SUMMARIZER_AVAILABLE = True
-except ImportError as e:
-    print(f"⚠️ Warning: SummarizerService not found ({e}). Running in Safe Mode.")
-    SUMMARIZER_AVAILABLE = False
-    
-    # Fallback dummy classes to prevent crashes
-    class SummarizationRequest(BaseModel):
-        text: str
-        options: dict = {}
-    class SummarizationResponse(BaseModel):
-        summary: str
-        metrics: dict
-        warnings: list = []
+# ─── Load settings ───────────────────────────────────────────────────────
+from src.settings import settings
 
-# --- IMPORTS FOR UNIVERSAL BRAIN ---
-try:
-    from src.engine.universal_brain import UniversalBrainService
-    BRAIN_AVAILABLE = True
-    print("✅ UniversalBrainService imported successfully")
-except ImportError as e:
-    print(f"⚠️ Warning: UniversalBrainService not found ({e}). '/process' will use mocks.")
-    BRAIN_AVAILABLE = False
-except Exception as e:
-    print(f"⚠️ Error importing UniversalBrainService: {e}")
-    BRAIN_AVAILABLE = False
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("brain_service")
 
-# =============================================================================
-# REQUEST/RESPONSE MODELS
-# =============================================================================
+# ─── Read API keys from settings ─────────────────────────────────────────────
+ANTHROPIC_API_KEY = settings.ANTHROPIC_API_KEY
+OPENAI_API_KEY    = settings.OPENAI_API_KEY
+GEMINI_API_KEY    = settings.GEMINI_API_KEY
+ANTHROPIC_MODEL   = settings.ANTHROPIC_MODEL
+OPENAI_MODEL      = settings.OPENAI_MODEL
+GEMINI_MODEL      = settings.GEMINI_MODEL
+HF_API_KEY        = settings.HF_API_KEY
+HF_MODEL          = settings.HF_MODEL
 
-class HealthResponse(BaseModel):
-    status: str
-    message: str
-    version: str
-    components: dict[str, str]
+# ─── Import AI clients ───────────────────────────────────────────────────────
+from src.ai.clients.claude_client  import ClaudeClient
+from src.ai.clients.openai_client  import OpenAIClient
+from src.ai.clients.gemini_client       import GeminiClient
+from src.ai.clients.huggingface_client  import HuggingFaceClient
+from src.ai.clients.base_client    import AIRequest, AIMessage, ModelProvider
+from src.memory.conversation_store import ConversationStore
+from src.rag.rag_pipeline import RAGPipeline
+from src.rag.embedding_service import EmbeddingService
+from src.grpc.server import GRPCServer
 
-class ProcessConversationRequest(BaseModel):
-    user_message: str
-    user_id: str
-    conversation_id: str | None = None
-    target_model: str = "claude"
-    context_hints: list[str] = []
+# ─── Global singletons (initialised in lifespan) ─────────────────────────────
+claude_client:  Optional[ClaudeClient]  = None
+openai_client:  Optional[OpenAIClient]  = None
+gemini_client:  Optional[GeminiClient]  = None
+hf_client:      Optional[HuggingFaceClient] = None
+conversation_store: Optional[ConversationStore] = None
+embedding_service: Optional[EmbeddingService] = None
+rag_pipeline: Optional[RAGPipeline] = None
+grpc_server: Optional[GRPCServer] = None
 
-class ProcessConversationResponse(BaseModel):
-    ai_response: str
-    conversation_type: str
-    context_theme: str
-    memory_effectiveness: str
-    context_used: list[dict] = []
-
-class BuildContextRequest(BaseModel):
-    conversation_blocks: list[str]
-    conversation_type: str
-    target_llm: str = "claude"
-    user_id: str
-
-class BuildContextResponse(BaseModel):
-    context_pack: dict
-    llm_injection_format: str
-    compression_ratio: float
-
-# =============================================================================
-# GLOBAL INSTANCES
-# =============================================================================
-
-# Initialize Summarizer
-summarizer_engine = SummarizerService() if SUMMARIZER_AVAILABLE else None
-
-# Initialize Universal Brain
-try:
-    brain_engine = UniversalBrainService() if BRAIN_AVAILABLE else None
-    if brain_engine:
-        print("🧠 Universal Brain: Online")
-except Exception as e:
-    print(f"⚠️ Failed to initialize Universal Brain: {e}")
-    brain_engine = None
-    BRAIN_AVAILABLE = False
-
-# =============================================================================
-# APPLICATION LIFECYCLE
-# =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifecycle manager.
-    """
-    print("\n🚀 Identra Brain-Service Starting...")
-    print("📁 Working Directory:", os.getcwd())
-    
-    # Check Components
-    if summarizer_engine:
-        print("✅ Summarizer Engine: Online (Llama 3.1 / Mistral)")
-    else:
-        print("❌ Summarizer Engine: Offline")
+    """Startup / shutdown lifecycle."""
+    global claude_client, openai_client, gemini_client, hf_client, conversation_store, rag_pipeline, grpc_server, embedding_service
 
-    if brain_engine:
-        print("✅ Universal Brain: Online (Orchestrator Ready)")
-    else:
-        print("❌ Universal Brain: Offline (Using Mock Responses)")
-    
-    print("🌐 Server will be available at: http://localhost:8001")
-    print("📋 Health check: http://localhost:8001/health")
-    
-    yield  # Application runs here
-    
-    print("🔄 Shutting down Brain-Service...")
+    # ── AI clients ────────────────────────────────────────────────────────
+    if ANTHROPIC_API_KEY and not ANTHROPIC_API_KEY.startswith("your_"):
+        try:
+            claude_client = ClaudeClient(api_key=ANTHROPIC_API_KEY)
+            logger.info("✅ Claude client ready")
+        except Exception as e:
+            logger.warning(f"⚠️  Claude init failed: {e}")
 
-# =============================================================================
-# FASTAPI APPLICATION
-# =============================================================================
+    if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("your_"):
+        try:
+            openai_client = OpenAIClient(api_key=OPENAI_API_KEY)
+            logger.info("✅ OpenAI client ready")
+        except Exception as e:
+            logger.warning(f"⚠️  OpenAI init failed: {e}")
 
+    if GEMINI_API_KEY and not GEMINI_API_KEY.startswith("your_"):
+        try:
+            gemini_client = GeminiClient(api_key=GEMINI_API_KEY)
+            logger.info("✅ Gemini client ready")
+        except Exception as e:
+            logger.warning(f"⚠️  Gemini init failed: {e}")
+
+    if HF_API_KEY and not HF_API_KEY.startswith("your_"):
+        try:
+            hf_client = HuggingFaceClient(api_key=HF_API_KEY)
+            logger.info("✅ HuggingFace client ready")
+        except Exception as e:
+            logger.warning(f"⚠️  HuggingFace init failed: {e}")
+
+    # ── Conversation store ────────────────────────────────────────────────
+    try:
+        embedding_service = EmbeddingService()
+        conversation_store = ConversationStore(db_path="conversations.db", embedding_service=embedding_service)
+        await conversation_store.initialize()
+        logger.info("✅ Conversation store ready")
+    except Exception as e:
+        logger.warning(f"⚠️  Conversation store init failed: {e}")
+
+    providers = []
+    if claude_client:  providers.append("Claude")
+    if openai_client:  providers.append("OpenAI")
+    if gemini_client:  providers.append("Gemini")
+    if hf_client:      providers.append("HuggingFace")
+    try:
+        rag_pipeline = RAGPipeline(db_path="conversations.db", embedding_service=embedding_service)
+        logger.info("✅ RAG Pipeline ready")
+    except Exception as e:
+        logger.warning(f"⚠️  RAG Pipeline init failed: {e}")
+
+    try:
+        if conversation_store:
+            grpc_server = GRPCServer(conversation_store, embedding_service=embedding_service)
+            grpc_server.start()
+            logger.info("✅ gRPC server ready on port 50051")
+    except Exception as e:
+        logger.warning(f"⚠️  gRPC server failed: {e}")
+
+    logger.info(f"🧠 Brain Service started — active providers: {providers or ['none (demo mode)']}")
+
+    yield  # app runs here
+
+    if grpc_server:
+        grpc_server.stop()
+    logger.info("🛑 Brain Service shutting down")
+
+
+# ─── App ─────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Identra Brain-Service",
-    description="Universal AI Memory & RAG Orchestration",
-    version="0.1.0",
-    lifespan=lifespan
+    title="Identra Brain Service",
+    version="2.0",
+    description="Multi-model AI + memory for Identra",
+    lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:1420"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# =============================================================================
-# CORE ENDPOINTS
-# =============================================================================
+# ─── Pydantic models ─────────────────────────────────────────────────────────
+class ChatRequest(BaseModel):
+    session_id: str
+    user_id:    str = "default_user"
+    message:    str
+    provider:   Optional[str] = None   # "claude" | "openai" | "gemini" | None (auto)
+    context:    Optional[Dict[str, Any]] = None
 
-@app.get("/health", response_model=HealthResponse)
-async def health_check() -> HealthResponse:
+class ChatResponse(BaseModel):
+    response:        str
+    model_used:      str
+    provider:        str
+    session_id:      str
+    processing_time: float
+
+class MemoryRequest(BaseModel):
+    content:    str
+    session_id: str
+    user_id:    str = "default_user"
+    role:       str = "user"
+
+class MemorySearchRequest(BaseModel):
+    query:   str
+    user_id: str = "default_user"
+    limit:   int = 5
+
+class HealthResponse(BaseModel):
+    status:    str
+    providers: Dict[str, bool]
+    version:   str
+
+
+# ─── Helper: pick best available client ──────────────────────────────────────
+def _pick_client(preferred: Optional[str]):
+    """Return (client, provider_name, model_name) for the best available provider."""
+    
+    order = []
+
+    if preferred == "claude"  and claude_client:  order = [(claude_client,  "claude",  ANTHROPIC_MODEL)]
+    elif preferred == "openai" and openai_client: order = [(openai_client, "openai",  OPENAI_MODEL)]
+    elif preferred == "gemini" and gemini_client: order = [(gemini_client, "gemini",  GEMINI_MODEL)]
+    else:
+        # Auto-select: HuggingFace → Gemini → OpenAI → Claude
+        if hf_client:      order.append((hf_client,      "huggingface", HF_MODEL))
+        if gemini_client:  order.append((gemini_client, "gemini",  GEMINI_MODEL))
+        if openai_client:  order.append((openai_client, "openai",  OPENAI_MODEL))
+        if claude_client:  order.append((claude_client,  "claude",  ANTHROPIC_MODEL))
+
+    if not order:
+        return None, None, None
+
+    return order[0]
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/health", response_model=HealthResponse)
+async def health_check():
     return HealthResponse(
-        status="healthy",
-        message="Identra Brain-Service is running",
-        version="0.1.0",
-        components={
-            "summarization_model": "online" if summarizer_engine else "offline",
-            "universal_brain": "online" if brain_engine else "offline",
-            "memory_integration": "connecting"
-        }
+        status="Brain Service is alive and thinking! 🧠",
+        providers={
+            "claude":  claude_client  is not None,
+            "openai":  openai_client  is not None,
+            "gemini":  gemini_client  is not None,
+            "huggingface": hf_client is not None,
+            "memory":  conversation_store is not None,
+        },
+        version="2.0",
     )
 
-@app.post("/summarize", response_model=SummarizationResponse)
-async def summarize_content(request: SummarizationRequest) -> SummarizationResponse:
-    """Universal Summarization Endpoint."""
-    if not summarizer_engine:
-        raise HTTPException(status_code=503, detail="Summarizer service is not available")
-    
-    try:
-        response = await summarizer_engine.summarize(request)
-        return response
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        print(f"Summarization Error: {e}")
-        raise HTTPException(status_code=500, detail="Internal summarization error")
 
-@app.post("/process", response_model=ProcessConversationResponse)
-async def process_conversation(request: ProcessConversationRequest) -> ProcessConversationResponse:
-    """
-    RAG-powered conversation context processing.
-    
-    YOUR ACTUAL RESPONSIBILITIES:
-    1. Retrieve relevant conversation history (RAG)
-    2. Build context for ANY model (user/tunnel-gateway chooses model)
-    3. Manage conversation memory and summarization
-    4. Return enriched context + conversation classification
-    """
-    try:
-        if brain_engine:
-            # Call the corrected RAG-focused method
-            result = await brain_engine.process_rag_context(
-                user_message=request.user_message,
+@app.post("/api/v1/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    start_time = time.time()
+
+    client, provider_name, model_name = _pick_client(request.provider)
+
+    # ── Demo / mock mode when no provider is available ────────────────────
+    if client is None:
+        return ChatResponse(
+            response=(
+                f"[DEMO MODE] No AI provider configured. "
+                f"Your message: '{request.message}'"
+            ),
+            model_used="demo",
+            provider="demo",
+            session_id=request.session_id,
+            processing_time=round(time.time() - start_time, 3),
+        )
+
+    # ── Build message history from memory ────────────────────────────────
+    history: List[AIMessage] = []
+    if conversation_store:
+        try:
+            past = await conversation_store.search_conversations(
                 user_id=request.user_id,
-                conversation_id=request.conversation_id,
-                context_hints=request.context_hints
+                query=request.message,
+                limit=5,
             )
-            
-            return ProcessConversationResponse(
-                ai_response=result["ai_response"],  # ✅ FIXED: Changed from context_summary
-                conversation_type=result["conversation_type"], 
-                context_theme=result["context_theme"],
-                memory_effectiveness=result["memory_effectiveness"],
-                context_used=result["context_used"]  # Actual retrieved conversations
-            )
-        else:
-            # --- FALLBACK MOCK LOGIC ---
-            return ProcessConversationResponse(
-                ai_response=f"Mock Response: {request.user_message}",
-                conversation_type="mock",
-                context_theme="none",
-                memory_effectiveness="zero",
-                context_used=[]
-            )
+            for conv in reversed(past):
+                history.append(AIMessage(role=conv.role, content=conv.message))
+        except Exception as e:
+            logger.warning(f"Memory retrieval failed: {e}")
 
-    except Exception as e:
-        print(f"RAG Processing Error: {e}")
-        raise HTTPException(status_code=500, detail=f"RAG Error: {str(e)}")
+    # RAG: Retrieve relevant memories and augment prompt
+    rag_result = {"augmented_prompt": request.message, "memories_used": 0}
+    if rag_pipeline:
+        try:
+            rag_result = rag_pipeline.process(
+                query=request.message,
+                user_id=request.user_id,
+                top_k=5
+            )
+            logger.info(f"🧠 RAG used {rag_result['memories_used']} memories")
+        except Exception as e:
+            logger.warning(f"RAG failed: {e}")
 
-@app.post("/build-context", response_model=BuildContextResponse)
-async def build_context(request: BuildContextRequest) -> BuildContextResponse:
-    """
-    Build LLM-optimized context pack from conversation blocks.
-    """
+    # Add Identra system prompt
+    system_prompt = AIMessage(
+        role="system",
+        content=(
+            "You are Identra, an intelligent AI assistant built to help developers "
+            "and teams work smarter. You are helpful, concise, and friendly. "
+            "You were created by the Identra team. Never say you are Qwen, Claude, "
+            "GPT, or any other AI. You are always Identra."
+        )
+    )
+    history.insert(0, system_prompt)
+
+    # Add current message
+    history.append(AIMessage(role="user", content=rag_result["augmented_prompt"]))
+
+    ai_request = AIRequest(
+        messages=history,
+        model_name=model_name,
+        temperature=0.7,
+        max_tokens=1024,
+        user_id=request.user_id,
+        conversation_id=request.session_id,
+    )
+
     try:
-        if brain_engine:
-            # --- REAL BRAIN LOGIC ---
-            result = await brain_engine.build_context_pack(
-                conversation_blocks=request.conversation_blocks,
-                conversation_type=request.conversation_type,
-                target_llm=request.target_llm,
-                user_id=request.user_id
-            )
-            
-            return BuildContextResponse(
-                context_pack=result["context_pack"],
-                llm_injection_format=result["llm_injection_format"],
-                compression_ratio=result["compression_ratio"]
-            )
-        else:
-            # --- FALLBACK MOCK LOGIC ---
-            return BuildContextResponse(
-                context_pack={
-                    "context_type": "conversation_memory",
-                    "conversation_metadata": {
-                        "type": request.conversation_type,
-                        "participants": [request.user_id],
-                        "created_at": "2026-02-04T10:30:00Z"
-                    },
-                    "memory_content": {
-                        "summary": "Context construction logic coming next step",
-                        "key_points": ["point1", "point2"],
-                    }
-                },
-                llm_injection_format=f"Optimized for {request.target_llm}",
-                compression_ratio=0.3
-            )
-    except Exception as e:
-        print(f"Context Building Error: {e}")
-        raise HTTPException(status_code=500, detail="Internal context building error")
+        ai_response = await client.generate_response(ai_request)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8001,
-        reload=True,
-        log_level="info"
-    ) 
+        # ── Store both turns in memory ────────────────────────────────
+        if conversation_store:
+            try:
+                await conversation_store.store_message(
+                    user_id=request.user_id,
+                    message=request.message,
+                    role="user",
+                    conversation_id=request.session_id,
+                )
+                await conversation_store.store_message(
+                    user_id=request.user_id,
+                    message=ai_response.content,
+                    role="assistant",
+                    conversation_id=request.session_id,
+                )
+            except Exception as e:
+                logger.warning(f"Memory store failed: {e}")
+
+        return ChatResponse(
+            response=ai_response.content,
+            model_used=ai_response.model_used,
+            provider=provider_name,
+            session_id=request.session_id,
+            processing_time=round(time.time() - start_time, 3),
+        )
+
+    except Exception as e:
+        logger.error(f"Chat error ({provider_name}): {e}")
+        raise HTTPException(status_code=500, detail=f"{provider_name} error: {str(e)}")
+
+
+@app.post("/api/v1/memory/store")
+async def store_memory(request: MemoryRequest):
+    if not conversation_store:
+        return {"status": "skipped", "reason": "Memory store not available"}
+    try:
+        await conversation_store.store_message(
+            user_id=request.user_id,
+            message=request.content,
+            role=request.role,
+            conversation_id=request.session_id,
+        )
+        return {"status": "success", "saved_content": request.content}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Memory store error: {str(e)}")
+
+
+@app.post("/api/v1/memory/search")
+async def search_memory(request: MemorySearchRequest):
+    if not conversation_store:
+        return {"results": [], "reason": "Memory store not available"}
+    try:
+        results = await conversation_store.search_conversations(
+            user_id=request.user_id,
+            query=request.query,
+            limit=request.limit,
+        )
+        return {
+            "results": [
+                {
+                    "message":           r.message,
+                    "role":              r.role,
+                    "timestamp":         r.timestamp.isoformat(),
+                    "similarity_score":  round(r.similarity_score, 4),
+                    "conversation_id":   r.conversation_id,
+                }
+                for r in results
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Memory search error: {str(e)}")
+
+
+@app.get("/api/v1/models")
+async def list_models():
+    """List all available AI models."""
+    available: Dict[str, Any] = {}
+    if claude_client:
+        available["claude"] = {"models": claude_client.get_available_models(), "default": ANTHROPIC_MODEL}
+    if openai_client:
+        available["openai"] = {"models": openai_client.get_available_models(), "default": OPENAI_MODEL}
+    if gemini_client:
+        available["gemini"] = {"models": gemini_client.get_available_models(), "default": GEMINI_MODEL}
+    if hf_client:
+        available["huggingface"] = {"models": hf_client.get_available_models(), "default": HF_MODEL}
+    return {"available_providers": available}
+
+
+@app.get("/api/v1/usage")
+async def usage_stats():
+    """Return token usage and cost across all providers."""
+    stats: Dict[str, Any] = {}
+    if claude_client:  stats["claude"]  = claude_client.get_usage_summary()
+    if openai_client:  stats["openai"]  = openai_client.get_usage_summary()
+    if gemini_client:  stats["gemini"]  = gemini_client.get_usage_summary()
+    if hf_client:      stats["huggingface"] = hf_client.get_usage_summary()
+    return stats

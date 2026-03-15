@@ -20,6 +20,7 @@ class ModelProvider(str, Enum):
     CLAUDE = "claude"
     OPENAI = "openai"
     GEMINI = "gemini"
+    HUGGINGFACE = "huggingface"
 
 class AIMessage(BaseModel):
     """Standard message format for all AI providers"""

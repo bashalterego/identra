@@ -53,7 +53,7 @@ except ImportError:
 
 # Identra Summarizer Service
 try:
-    from ..ai.Summarizer_service import SummarizerService
+    from ..ai.summarizer_service import SummarizerService
     SUMMARIZER_AVAILABLE = True
 except ImportError:
     SUMMARIZER_AVAILABLE = False
